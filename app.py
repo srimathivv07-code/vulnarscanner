@@ -821,6 +821,141 @@ class Handler(BaseHTTPRequestHandler):
         )
 
 
+STATUS_TEXT = {
+    200: "200 OK",
+    400: "400 Bad Request",
+    401: "401 Unauthorized",
+    404: "404 Not Found",
+    500: "500 Internal Server Error",
+}
+
+
+def wsgi_response(start_response, status_code, body, content_type="application/json; charset=utf-8", headers=None):
+    if isinstance(body, (dict, list)):
+        body = json.dumps(body, separators=(",", ":"))
+    if isinstance(body, str):
+        body = body.encode("utf-8")
+    response_headers = [
+        ("Content-Type", content_type),
+        ("Content-Length", str(len(body))),
+        ("X-Content-Type-Options", "nosniff"),
+        ("Referrer-Policy", "strict-origin-when-cross-origin"),
+        ("X-Frame-Options", "DENY"),
+        ("Permissions-Policy", "camera=(), microphone=(), geolocation=()"),
+    ]
+    response_headers.extend((headers or {}).items())
+    start_response(STATUS_TEXT.get(status_code, f"{status_code} OK"), response_headers)
+    return [body]
+
+
+def wsgi_json_body(environ):
+    try:
+        length = int(environ.get("CONTENT_LENGTH") or "0")
+    except ValueError:
+        length = 0
+    if length > MAX_BODY_BYTES:
+        raise ValueError("Request body is too large")
+    raw = environ["wsgi.input"].read(length) if length else b"{}"
+    try:
+        return json.loads(raw.decode("utf-8") or "{}")
+    except json.JSONDecodeError:
+        raise ValueError("Invalid JSON")
+
+
+def wsgi_user(environ):
+    return read_session(environ.get("HTTP_COOKIE"))
+
+
+def app(environ, start_response):
+    """WSGI entrypoint for Render's default gunicorn app:app command."""
+    path = environ.get("PATH_INFO", "/")
+    method = environ.get("REQUEST_METHOD", "GET").upper()
+
+    try:
+        if method == "GET":
+            if path == "/healthz":
+                return wsgi_response(start_response, 200, {"ok": True})
+            if path == "/api/check-auth":
+                user = wsgi_user(environ)
+                return wsgi_response(start_response, 200, {"authenticated": bool(user), "user": user})
+            if path in ("/", "/login"):
+                return wsgi_response(start_response, 200, INDEX_HTML, "text/html; charset=utf-8")
+            return wsgi_response(start_response, 404, {"success": False, "error": "Not found"})
+
+        if method != "POST":
+            return wsgi_response(start_response, 404, {"success": False, "error": "Not found"})
+
+        data = wsgi_json_body(environ)
+        if path == "/api/send-otp":
+            email = (data.get("email") or "").strip().lower()
+            name = (data.get("name") or "").strip()
+            if not re.match(r"^[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}$", email):
+                raise ValueError("Enter a valid email address")
+            otp = "".join(random.choices(string.digits, k=6))
+            OTP_STORAGE[email] = {
+                "otp_hash": hashlib.sha256((otp + SECRET_KEY).encode("utf-8")).hexdigest(),
+                "expires": time.time() + 300,
+                "attempts": 0,
+                "name": name,
+            }
+            send_otp_email(email, otp)
+            response = {"success": True, "message": "OTP sent", "email": email}
+            if DEV_OTP_FALLBACK:
+                response["dev_otp"] = otp
+            return wsgi_response(start_response, 200, response)
+
+        if path == "/api/verify-otp":
+            email = (data.get("email") or "").strip().lower()
+            otp = (data.get("otp") or "").strip()
+            record = OTP_STORAGE.get(email)
+            if not record:
+                raise ValueError("No OTP found. Request a new one.")
+            if time.time() > record["expires"]:
+                OTP_STORAGE.pop(email, None)
+                raise ValueError("OTP expired. Request a new one.")
+            if record["attempts"] >= 3:
+                OTP_STORAGE.pop(email, None)
+                raise ValueError("Too many attempts. Request a new OTP.")
+            expected = record["otp_hash"]
+            provided = hashlib.sha256((otp + SECRET_KEY).encode("utf-8")).hexdigest()
+            if not hmac.compare_digest(expected, provided):
+                record["attempts"] += 1
+                raise ValueError(f"Invalid OTP. {3 - record['attempts']} attempt(s) remaining.")
+
+            OTP_STORAGE.pop(email, None)
+            name = record.get("name") or (data.get("name") or "").strip() or email.split("@")[0]
+            USERS[email] = {"email": email, "name": name, "role": "user"}
+            cookie = make_session(USERS[email])
+            secure = "; Secure" if SESSION_COOKIE_SECURE else ""
+            return wsgi_response(
+                start_response,
+                200,
+                {"success": True, "message": "Verification successful", "user": USERS[email]},
+                headers={"Set-Cookie": f"ds_session={cookie}; Path=/; Max-Age={SESSION_TTL_SECONDS}; HttpOnly; SameSite=Lax{secure}"},
+            )
+
+        if path == "/api/logout":
+            secure = "; Secure" if SESSION_COOKIE_SECURE else ""
+            return wsgi_response(
+                start_response,
+                200,
+                {"success": True},
+                headers={"Set-Cookie": f"ds_session=; Path=/; Max-Age=0; HttpOnly; SameSite=Lax{secure}"},
+            )
+
+        if path in ("/scan", "/chat") and not wsgi_user(environ):
+            return wsgi_response(start_response, 401, {"success": False, "error": "Authentication required"})
+        if path == "/scan":
+            return wsgi_response(start_response, 200, scan_target(data.get("url", "")))
+        if path == "/chat":
+            return wsgi_response(start_response, 200, {"reply": chat_reply(data.get("vulnerability", ""))})
+        return wsgi_response(start_response, 404, {"success": False, "error": "Not found"})
+    except ValueError as exc:
+        return wsgi_response(start_response, 400, {"success": False, "error": str(exc)})
+    except Exception as exc:
+        return wsgi_response(start_response, 500, {"success": False, "error": str(exc)})
+
+
 def run():
     port = int(os.environ.get("PORT", "5000"))
     server = ThreadingHTTPServer(("0.0.0.0", port), Handler)
