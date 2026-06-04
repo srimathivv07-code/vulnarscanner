@@ -15,6 +15,7 @@ Optional environment variables:
   MAIL_PORT               default: 587
   MAIL_USE_TLS            default: true
   MAIL_DEFAULT_SENDER     default: MAIL_USERNAME
+  SMTP_FORCE_IPV4         true avoids Render IPv6 route errors, default: true
   DEV_OTP_FALLBACK        true returns OTP in API response for local testing only
   SESSION_COOKIE_SECURE   true adds Secure to the auth cookie, default: false
 """
@@ -36,6 +37,7 @@ import random
 import re
 import secrets
 import smtplib
+import socket
 import ssl
 import string
 import time
@@ -45,6 +47,7 @@ APP_NAME = "DeepSeek Scanner"
 SECRET_KEY = os.environ.get("SECRET_KEY") or secrets.token_urlsafe(48)
 DEV_OTP_FALLBACK = os.environ.get("DEV_OTP_FALLBACK", "false").lower() == "true"
 SESSION_COOKIE_SECURE = os.environ.get("SESSION_COOKIE_SECURE", "false").lower() == "true"
+SMTP_FORCE_IPV4 = os.environ.get("SMTP_FORCE_IPV4", "true").lower() == "true"
 SESSION_TTL_SECONDS = 60 * 60 * 12
 MAX_BODY_BYTES = 256 * 1024
 
@@ -682,11 +685,21 @@ def send_otp_email(email, otp):
         subtype="html",
     )
 
-    with smtplib.SMTP(server, port, timeout=20) as smtp:
+    smtp_host = resolve_ipv4(server) if SMTP_FORCE_IPV4 else server
+    with smtplib.SMTP(smtp_host, port, timeout=20) as smtp:
+        if smtp_host != server:
+            smtp._host = server
         if use_tls:
             smtp.starttls()
         smtp.login(username, password)
         smtp.send_message(msg)
+
+
+def resolve_ipv4(host):
+    addresses = socket.getaddrinfo(host, None, socket.AF_INET, socket.SOCK_STREAM)
+    if not addresses:
+        raise OSError(f"No IPv4 address found for SMTP host {host}")
+    return addresses[0][4][0]
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -785,8 +798,14 @@ class Handler(BaseHTTPRequestHandler):
             "attempts": 0,
             "name": name,
         }
-        send_otp_email(email, otp)
         response = {"success": True, "message": "OTP sent", "email": email}
+        try:
+            send_otp_email(email, otp)
+        except Exception as exc:
+            if not DEV_OTP_FALLBACK:
+                raise RuntimeError(f"Unable to send OTP email. Check MAIL_* settings or set DEV_OTP_FALLBACK=true for testing. Details: {exc}")
+            response["message"] = "Email delivery failed, using fallback OTP"
+            response["mail_error"] = str(exc)
         if DEV_OTP_FALLBACK:
             response["dev_otp"] = otp
         self.send_json(200, response)
@@ -898,8 +917,14 @@ def app(environ, start_response):
                 "attempts": 0,
                 "name": name,
             }
-            send_otp_email(email, otp)
             response = {"success": True, "message": "OTP sent", "email": email}
+            try:
+                send_otp_email(email, otp)
+            except Exception as exc:
+                if not DEV_OTP_FALLBACK:
+                    raise RuntimeError(f"Unable to send OTP email. Check MAIL_* settings or set DEV_OTP_FALLBACK=true for testing. Details: {exc}")
+                response["message"] = "Email delivery failed, using fallback OTP"
+                response["mail_error"] = str(exc)
             if DEV_OTP_FALLBACK:
                 response["dev_otp"] = otp
             return wsgi_response(start_response, 200, response)
