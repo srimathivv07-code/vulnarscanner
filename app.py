@@ -16,8 +16,10 @@ Optional environment variables:
   MAIL_USE_TLS            default: true
   MAIL_DEFAULT_SENDER     default: MAIL_USERNAME
   SMTP_FORCE_IPV4         true avoids Render IPv6 route errors, default: true
-  DEV_OTP_FALLBACK        true always returns OTP in API response
-  OTP_FALLBACK_ON_MAIL_ERROR true returns OTP if SMTP delivery fails, default: true
+  RESEND_API_KEY          preferred on Render; sends email over HTTPS
+  RESEND_FROM             sender, default: DeepSeek Scanner <onboarding@resend.dev>
+  DEV_OTP_FALLBACK        true returns OTP in API response for local testing only
+  OTP_FALLBACK_ON_MAIL_ERROR true returns OTP if delivery fails, default: false
   SESSION_COOKIE_SECURE   true adds Secure to the auth cookie, default: false
 """
 
@@ -47,7 +49,7 @@ import time
 APP_NAME = "DeepSeek Scanner"
 SECRET_KEY = os.environ.get("SECRET_KEY") or secrets.token_urlsafe(48)
 DEV_OTP_FALLBACK = os.environ.get("DEV_OTP_FALLBACK", "false").lower() == "true"
-OTP_FALLBACK_ON_MAIL_ERROR = os.environ.get("OTP_FALLBACK_ON_MAIL_ERROR", "true").lower() == "true"
+OTP_FALLBACK_ON_MAIL_ERROR = os.environ.get("OTP_FALLBACK_ON_MAIL_ERROR", "false").lower() == "true"
 SESSION_COOKIE_SECURE = os.environ.get("SESSION_COOKIE_SECURE", "false").lower() == "true"
 SMTP_FORCE_IPV4 = os.environ.get("SMTP_FORCE_IPV4", "true").lower() == "true"
 SESSION_TTL_SECONDS = 60 * 60 * 12
@@ -662,6 +664,11 @@ def chat_reply(message):
 
 
 def send_otp_email(email, otp):
+    resend_key = (os.environ.get("RESEND_API_KEY") or "").strip()
+    if resend_key:
+        send_otp_with_resend(email, otp, resend_key)
+        return
+
     username = (os.environ.get("MAIL_USERNAME") or "").strip()
     password = (os.environ.get("MAIL_PASSWORD") or "").strip()
     if not username or not password:
@@ -695,6 +702,40 @@ def send_otp_email(email, otp):
             smtp.starttls()
         smtp.login(username, password)
         smtp.send_message(msg)
+
+
+def send_otp_with_resend(email, otp, api_key):
+    sender = (os.environ.get("RESEND_FROM") or "DeepSeek Scanner <onboarding@resend.dev>").strip()
+    subject = f"Your {APP_NAME} OTP"
+    html_body = (
+        f"<div style='font-family:Arial;padding:20px;background:#101827;color:#eef4ff'>"
+        f"<h1>{html.escape(APP_NAME)}</h1><p>Your OTP is:</p>"
+        f"<div style='font-size:34px;letter-spacing:8px;font-weight:800'>{otp}</div>"
+        f"<p>It expires in 5 minutes.</p></div>"
+    )
+    payload = {
+        "from": sender,
+        "to": [email],
+        "subject": subject,
+        "html": html_body,
+        "text": f"Your {APP_NAME} OTP is {otp}. It expires in 5 minutes.",
+    }
+    req = Request(
+        "https://api.resend.com/emails",
+        data=json.dumps(payload).encode("utf-8"),
+        headers={
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json",
+        },
+        method="POST",
+    )
+    try:
+        with urlopen(req, timeout=20) as resp:
+            if resp.status >= 300:
+                raise RuntimeError(resp.read().decode("utf-8", errors="replace"))
+    except HTTPError as exc:
+        detail = exc.read().decode("utf-8", errors="replace")
+        raise RuntimeError(f"Resend API error {exc.code}: {detail}")
 
 
 def resolve_ipv4(host):
@@ -805,7 +846,7 @@ class Handler(BaseHTTPRequestHandler):
             send_otp_email(email, otp)
         except Exception as exc:
             if not (DEV_OTP_FALLBACK or OTP_FALLBACK_ON_MAIL_ERROR):
-                raise RuntimeError(f"Unable to send OTP email. Check MAIL_* settings or enable OTP fallback. Details: {exc}")
+                raise RuntimeError(f"Unable to send OTP email. On Render, set RESEND_API_KEY and RESEND_FROM, or use a paid instance for SMTP. Details: {exc}")
             response["message"] = "Email delivery failed, using fallback OTP"
             response["mail_error"] = str(exc)
             response["dev_otp"] = otp
@@ -925,7 +966,7 @@ def app(environ, start_response):
                 send_otp_email(email, otp)
             except Exception as exc:
                 if not (DEV_OTP_FALLBACK or OTP_FALLBACK_ON_MAIL_ERROR):
-                    raise RuntimeError(f"Unable to send OTP email. Check MAIL_* settings or enable OTP fallback. Details: {exc}")
+                    raise RuntimeError(f"Unable to send OTP email. On Render, set RESEND_API_KEY and RESEND_FROM, or use a paid instance for SMTP. Details: {exc}")
                 response["message"] = "Email delivery failed, using fallback OTP"
                 response["mail_error"] = str(exc)
                 response["dev_otp"] = otp
