@@ -16,7 +16,8 @@ Optional environment variables:
   MAIL_USE_TLS            default: true
   MAIL_DEFAULT_SENDER     default: MAIL_USERNAME
   SMTP_FORCE_IPV4         true avoids Render IPv6 route errors, default: true
-  DEV_OTP_FALLBACK        true returns OTP in API response for local testing only
+  DEV_OTP_FALLBACK        true always returns OTP in API response
+  OTP_FALLBACK_ON_MAIL_ERROR true returns OTP if SMTP delivery fails, default: true
   SESSION_COOKIE_SECURE   true adds Secure to the auth cookie, default: false
 """
 
@@ -46,6 +47,7 @@ import time
 APP_NAME = "DeepSeek Scanner"
 SECRET_KEY = os.environ.get("SECRET_KEY") or secrets.token_urlsafe(48)
 DEV_OTP_FALLBACK = os.environ.get("DEV_OTP_FALLBACK", "false").lower() == "true"
+OTP_FALLBACK_ON_MAIL_ERROR = os.environ.get("OTP_FALLBACK_ON_MAIL_ERROR", "true").lower() == "true"
 SESSION_COOKIE_SECURE = os.environ.get("SESSION_COOKIE_SECURE", "false").lower() == "true"
 SMTP_FORCE_IPV4 = os.environ.get("SMTP_FORCE_IPV4", "true").lower() == "true"
 SESSION_TTL_SECONDS = 60 * 60 * 12
@@ -660,17 +662,17 @@ def chat_reply(message):
 
 
 def send_otp_email(email, otp):
-    username = os.environ.get("MAIL_USERNAME")
-    password = os.environ.get("MAIL_PASSWORD")
+    username = (os.environ.get("MAIL_USERNAME") or "").strip()
+    password = (os.environ.get("MAIL_PASSWORD") or "").strip()
     if not username or not password:
         if DEV_OTP_FALLBACK:
             return
         raise RuntimeError("Mail credentials are not configured")
 
-    server = os.environ.get("MAIL_SERVER", "smtp.gmail.com")
-    port = int(os.environ.get("MAIL_PORT", "587"))
-    use_tls = os.environ.get("MAIL_USE_TLS", "true").lower() == "true"
-    sender = os.environ.get("MAIL_DEFAULT_SENDER", username)
+    server = (os.environ.get("MAIL_SERVER") or "smtp.gmail.com").strip()
+    port = int((os.environ.get("MAIL_PORT") or "587").strip())
+    use_tls = (os.environ.get("MAIL_USE_TLS") or "true").strip().lower() == "true"
+    sender = (os.environ.get("MAIL_DEFAULT_SENDER") or username).strip()
 
     msg = EmailMessage()
     msg["Subject"] = f"Your {APP_NAME} OTP"
@@ -802,10 +804,11 @@ class Handler(BaseHTTPRequestHandler):
         try:
             send_otp_email(email, otp)
         except Exception as exc:
-            if not DEV_OTP_FALLBACK:
-                raise RuntimeError(f"Unable to send OTP email. Check MAIL_* settings or set DEV_OTP_FALLBACK=true for testing. Details: {exc}")
+            if not (DEV_OTP_FALLBACK or OTP_FALLBACK_ON_MAIL_ERROR):
+                raise RuntimeError(f"Unable to send OTP email. Check MAIL_* settings or enable OTP fallback. Details: {exc}")
             response["message"] = "Email delivery failed, using fallback OTP"
             response["mail_error"] = str(exc)
+            response["dev_otp"] = otp
         if DEV_OTP_FALLBACK:
             response["dev_otp"] = otp
         self.send_json(200, response)
@@ -921,10 +924,11 @@ def app(environ, start_response):
             try:
                 send_otp_email(email, otp)
             except Exception as exc:
-                if not DEV_OTP_FALLBACK:
-                    raise RuntimeError(f"Unable to send OTP email. Check MAIL_* settings or set DEV_OTP_FALLBACK=true for testing. Details: {exc}")
+                if not (DEV_OTP_FALLBACK or OTP_FALLBACK_ON_MAIL_ERROR):
+                    raise RuntimeError(f"Unable to send OTP email. Check MAIL_* settings or enable OTP fallback. Details: {exc}")
                 response["message"] = "Email delivery failed, using fallback OTP"
                 response["mail_error"] = str(exc)
+                response["dev_otp"] = otp
             if DEV_OTP_FALLBACK:
                 response["dev_otp"] = otp
             return wsgi_response(start_response, 200, response)
